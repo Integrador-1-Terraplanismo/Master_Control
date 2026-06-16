@@ -97,6 +97,47 @@ void process_pc_command(const char* command, char* response_buffer, size_t max_r
         } else {
             snprintf(response_buffer, max_resp_len, "ERRO:ESP32 em Modo de Gravacao Serial\n");
         }
+    }
+    else if (strcmp(cmd_copy, "TESTE_SERVO") == 0) {
+        if (current_state == STATE_IDLE || current_state == STATE_IDLE) {
+            ESP_LOGI(TAG, "[WI-FI] Iniciando rotina de testes do Servo 1...");
+            
+            // Realiza a varredura física completa do Servo 1
+            servo_set_angle(SERVO_1, 90);
+            for(int i=0;i<10;i++); 
+            servo_set_angle(SERVO_2, 90); 
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            
+            servo_set_angle(SERVO_1, 180);
+            for(int i=0;i<10;i++); 
+            servo_set_angle(SERVO_2, 180);  
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            
+            servo_set_angle(SERVO_1, 0);
+            for(int i=0;i<10;i++); 
+            servo_set_angle(SERVO_2, 0);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+
+            servo_set_angle(SERVO_3, 90);
+            for(int i=0;i<10;i++); 
+            servo_set_angle(SERVO_4, 90);  
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            
+            servo_set_angle(SERVO_3, 180); 
+            for(int i=0;i<10;i++); 
+            servo_set_angle(SERVO_4, 180); 
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            
+            servo_set_angle(SERVO_3, 0);
+            for(int i=0;i<10;i++); 
+            servo_set_angle(SERVO_4, 0);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            
+            // Retorna a resposta de sucesso para o Python saber que acabou
+            snprintf(response_buffer, max_resp_len, "TESTE_SERVO_CONCLUIDO\n");
+        } else {
+            snprintf(response_buffer, max_resp_len, "busy\n");
+        }
     } else {
         snprintf(response_buffer, max_resp_len, "COMANDO_INVALIDO\n");
     }
@@ -229,6 +270,55 @@ void serial_monitor_task(void *pvParameters) {
                     fflush(stdout);
                 } else {
                     printf("\nNão é possível limpar o banco de dados enquanto o sistema estiver ocupado.\n");
+                }
+            }
+            
+            else if (strcmp(input, "TESTE") == 0) {
+                if (current_state == STATE_IDLE) {
+                    printf("\n==================================================\n");
+                    printf("[🧪 TESTE IR] Iniciando injeção de comandos na fita...\n");
+                    printf("==================================================\n");
+                    fflush(stdout);
+
+                    // Garante que a fita está ligada antes de mandar as cores
+                    printf("[TESTE] Enviando comando: LIGAR...\n");
+                    led_ctrl_send_command(IR_CMD_ON);
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+
+                    printf("[TESTE] Injetando cor: VERMELHA (3s)...\n");
+                    led_ctrl_send_command(IR_CMD_RED);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+
+                    printf("[TESTE] Injetando cor: VERDE (3s)...\n");
+                    led_ctrl_send_command(IR_CMD_GREEN);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+
+                    printf("[TESTE] Injetando cor: AZUL (3s)...\n");
+                    led_ctrl_send_command(IR_CMD_BLUE);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+
+                    printf("[TESTE] Enviando comando: DESLIGAR...\n");
+                    led_ctrl_send_command(IR_CMD_OFF);
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+
+                    // --- Teste do Servo Motor ---
+                    printf("[TESTE] Movendo Servo 1 para 90°...\n");
+                    servo_set_angle(SERVO_1, 90);
+                    vTaskDelay(pdMS_TO_TICKS(1500));
+
+                    printf("[TESTE] Movendo Servo 1 para 180° (Trancado)...\n");
+                    servo_set_angle(SERVO_1, 180);
+                    vTaskDelay(pdMS_TO_TICKS(1500));
+
+                    printf("[TESTE] Retornando Servo 1 para 0° (Seguro)...\n");
+                    servo_set_angle(SERVO_1, 0);
+                    vTaskDelay(pdMS_TO_TICKS(1500));
+
+                    printf("\n[✅ SUCESSO] Injeção de comandos finalizada!\n");
+                    printf("==================================================\n\n");
+                    fflush(stdout);
+                } else {
+                    printf("\nNão é possível rodar o teste com o sistema ocupado.\n");
                 }
             }
 
