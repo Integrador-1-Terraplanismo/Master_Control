@@ -142,9 +142,14 @@ void handle_nfc_detection(uint8_t *uid) {
 
                 ESP_LOGI(TAG, "Planeta Correto: %s!", detected_planet_name);
                 tcp_send_reply(TCP_REPLY_RECD);
-                servo_set_angle(SERVO_1, 90);
+                servo_set_angle(SERVO_1, 0);
+                servo_set_angle(SERVO_2, 0);
                 led_ctrl_set_state(true);
                 requested_planet[0] = '\0';
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                servo_set_angle(SERVO_1, 90);
+                servo_set_angle(SERVO_2, 90);
+                failed_attempts = 0;
             } 
             else {
                 ESP_LOGW(TAG, "Planeta Errado: %s (Esperado: %s)", detected_planet_name, requested_planet);
@@ -166,8 +171,13 @@ void handle_nfc_detection(uint8_t *uid) {
 
             ESP_LOGE(TAG, "3 tentativas falhas atingidas. Bloqueando mecanismo...");
             servo_set_angle(SERVO_1, 180);
+            servo_set_angle(SERVO_2, 180);
             led_ctrl_set_state(false);
             requested_planet[0] = '\0';
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            servo_set_angle(SERVO_1, 90);
+            servo_set_angle(SERVO_2, 90);
+            failed_attempts = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(1500));
     }
@@ -188,6 +198,16 @@ void serial_monitor_task(void *pvParameters) {
             input[strcspn(input, "\r\n")] = 0;
             string_to_uppercase(input);
 
+            if (strcmp(input, "LISTAR") == 0) {
+                char buffer_local[1024];
+                storage_get_file_content(buffer_local, sizeof(buffer_local));
+                printf("\n--- CONTEÚDO DO ARQUIVO PLANETAS.TXT ---\n");
+                printf("%s", buffer_local);
+                printf("----------------------------------------\n\n");
+                fflush(stdout);
+                continue;
+            }
+
             if (strcmp(input, "END") == 0) {
                 if (current_state != STATE_IDLE) {
                     current_state = STATE_IDLE;
@@ -198,6 +218,20 @@ void serial_monitor_task(void *pvParameters) {
                     printf("\nO sistema ja esta no Modo Normal.\n");
                 }
             }
+            
+            else if (strcmp(input, "LIMPAR") == 0) {
+                if (current_state == STATE_IDLE) {
+                    // Executa a função que apaga o arquivo do SPIFFS
+                    storage_clear_all();
+                    
+                    printf("\n[SUCESSO] O banco de dados (planetas.txt) foi totalmente limpo!\n");
+                    printf("Você já pode digitar 'GRAVAR' para iniciar um novo mapeamento.\n");
+                    fflush(stdout);
+                } else {
+                    printf("\nNão é possível limpar o banco de dados enquanto o sistema estiver ocupado.\n");
+                }
+            }
+
             else if (strcmp(input, "GRAVAR") == 0) {
                 if (current_state == STATE_IDLE) {
                     current_state = STATE_RECORD_GET_PLANET;
@@ -251,6 +285,7 @@ void leitura_timeout_callback(TimerHandle_t xTimer) {
         current_state = STATE_IDLE;
         requested_planet[0] = '\0';
         servo_set_angle(SERVO_1, 180); 
+        servo_set_angle(SERVO_2, 180);
         led_ctrl_set_state(false);
     }
 }

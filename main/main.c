@@ -39,7 +39,10 @@ void app_main(void) {
     xTaskCreate(serial_monitor_task, "serial_task", 4096, NULL, 10, NULL);
 
     // Define os estados iniciais seguros dos atuadores
-    servo_set_angle(SERVO_1, 0);
+    servo_set_angle(SERVO_1, 90);
+    servo_set_angle(SERVO_2, 90);
+    servo_set_angle(SERVO_3, 0);
+    servo_set_angle(SERVO_4, 0);
     led_ctrl_set_state(false);
 
     // Loop principal da main apenas mantendo o clock vivo
