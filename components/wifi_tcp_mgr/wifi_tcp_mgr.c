@@ -138,3 +138,9 @@ void wifi_tcp_init(void) {
     // Inicia a Task do TCP Server
     xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
 }
+
+void wifi_tcp_send_raw(const char* data) {
+    if (active_sock >= 0 && data != NULL) {
+        send(active_sock, data, strlen(data), 0);
+    }
+}

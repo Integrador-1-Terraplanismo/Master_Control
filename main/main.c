@@ -9,6 +9,7 @@
 #include "wifi_tcp_mgr.h"
 #include "nfc_reader.h"
 #include "storage_mgr.h"
+#include "button_matrix.h"
 
 void app_main(void) {
     // Inicialização de todos os subcomponentes de hardware e storage
@@ -16,6 +17,7 @@ void app_main(void) {
     servo_ctrl_init();
     storage_init();
     nfc_reader_init();
+    button_matrix_init();
     system_logic_init();
     vTaskDelay(pdMS_TO_TICKS(300));
     wifi_tcp_init(); 

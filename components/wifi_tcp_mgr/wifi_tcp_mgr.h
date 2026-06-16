@@ -13,5 +13,6 @@ typedef enum {
 
 void wifi_tcp_init(void);
 void tcp_send_reply(tcp_reply_t reply_type);
+void wifi_tcp_send_raw(const char* data);
 
 #endif

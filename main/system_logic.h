@@ -24,5 +24,6 @@ void iniciar_timer_leitura(void);
 void init_timers(void);
 void leitura_timeout_callback(TimerHandle_t xTimer);
 void system_logic_init(void);
+void executar_loop_minigame(void);
 
 #endif // SYSTEM_LOGIC_H

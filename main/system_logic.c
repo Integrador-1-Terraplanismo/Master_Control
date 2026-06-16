@@ -12,6 +12,8 @@
 #include "servo_ctrl.h"
 #include "wifi_tcp_mgr.h"
 #include "storage_mgr.h"
+#include "button_matrix.h"
+#include "nfc_reader.h"
 
 static const char *TAG = "SYSTEM_LOGIC";
 static TimerHandle_t leitura_timer = NULL;
@@ -138,7 +140,55 @@ void process_pc_command(const char* command, char* response_buffer, size_t max_r
         } else {
             snprintf(response_buffer, max_resp_len, "busy\n");
         }
-    } else {
+    }
+    if (strcmp(cmd_copy, "MINIGAME") == 0) {
+        if (current_state == STATE_IDLE) {
+            current_state = STATE_MINIGAME;
+            
+            // Otimização de Processamento: Desliga/Para o loop assíncrono do leitor NFC
+            nfc_reader_stop_reading();
+            
+            snprintf(response_buffer, max_resp_len, "MINIGAME_START_ACK\n");
+            
+            // Bloqueia e assume o controle nesta linha rodando o jogo em tempo real
+            executar_loop_minigame();
+            return;
+        } else {
+            snprintf(response_buffer, max_resp_len, "busy\n");
+            return;
+        }
+    }
+    if (strcmp(cmd_copy, "MINIGAME") == 0) {
+        if (current_state == STATE_IDLE) {
+            current_state = STATE_MINIGAME;
+            
+            // Otimização de Processamento: Desliga/Para o loop assíncrono do leitor NFC
+            nfc_reader_stop_reading();
+            
+            snprintf(response_buffer, max_resp_len, "MINIGAME_START_ACK\n");
+            
+            // Bloqueia e assume o controle nesta linha rodando o jogo em tempo real
+            executar_loop_minigame();
+            return;
+        } else {
+            snprintf(response_buffer, max_resp_len, "busy\n");
+            return;
+        }
+    }
+    // Comando enviado pelo Python (Ctrl+C) para ENCERRAR o jogo
+    if (strcmp(cmd_copy, "FIM_MINIGAME") == 0) {
+        if (current_state == STATE_MINIGAME) {
+            current_state = STATE_IDLE; // Retorna ao modo padrão
+            
+            // Reativa a varredura contínua do NFC para que as tags voltem a funcionar
+            nfc_reader_start_reading();
+            
+            snprintf(response_buffer, max_resp_len, "MODO_NORMAL_RESTABELECIDO\n");
+            return;
+        }
+    }
+    
+    else {
         snprintf(response_buffer, max_resp_len, "COMANDO_INVALIDO\n");
     }
     xTimerStop(leitura_timer, 0);
@@ -247,6 +297,46 @@ void serial_monitor_task(void *pvParameters) {
                 printf("----------------------------------------\n\n");
                 fflush(stdout);
                 continue;
+            }
+
+            else if (strcmp(input, "TESTE_BOTOES") == 0) {
+                if (current_state == STATE_IDLE) {
+                    printf("\n==================================================\n");
+                    printf("[🎮 TESTE TECLADO] Modo de Monitorização Ativado (10s)\n");
+                    printf("Pressione os botões amarelos para ver as leituras...\n");
+                    printf("==================================================\n");
+                    fflush(stdout);
+
+                    button_id_t ultimo_botao = BTN_NONE;
+                    
+                    // Executa o loop rápido por 10 segundos (10000ms / 50ms = 200 iterações)
+                    for (int i = 0; i < 400; i++) {
+                        button_id_t botao_atual = button_matrix_read();
+
+                        // Só imprime quando o estado do botão mudar (evita inundar o terminal)
+                        if (botao_atual != ultimo_botao) {
+                            ultimo_botao = botao_atual;
+
+                            if (botao_atual != BTN_NONE) {
+                                printf("[TECLADO] Botão Pressionado: %d\n", botao_atual);
+                                fflush(stdout);
+                            } else {
+                                printf("[TECLADO] Nenhum botão pressionado (Solto)\n");
+                                fflush(stdout);
+                            }
+                        }
+
+                        // Polling rápido a cada 50ms para capturar cliques rápidos
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+
+                    printf("\n==================================================\n");
+                    printf("[✅ FIM] Tempo de teste esgotado. Retornando ao Modo Normal.\n");
+                    printf("==================================================\n\n");
+                    fflush(stdout);
+                } else {
+                    printf("\nNão é possível rodar o teste com o sistema ocupado.\n");
+                }
             }
 
             if (strcmp(input, "END") == 0) {
@@ -377,6 +467,34 @@ void leitura_timeout_callback(TimerHandle_t xTimer) {
         servo_set_angle(SERVO_1, 180); 
         servo_set_angle(SERVO_2, 180);
         led_ctrl_set_state(false);
+    }
+}
+
+void executar_loop_minigame(void) {
+    button_id_t ultimo_botao = BTN_NONE;
+    char msg_tcp[32];
+
+    ESP_LOGI(TAG, "Entrou no loop de baixa latência do Mini-game.");
+
+    while (current_state == STATE_MINIGAME) {
+        button_id_t botao_atual = button_matrix_read();
+
+        // Só envia dados se o estado do botão mudar (evita inundar o socket TCP de lixo)
+        if (botao_atual != ultimo_botao) {
+            ultimo_botao = botao_atual;
+
+            if (botao_atual != BTN_NONE) {
+                // Formata o pacote rápido para o Python (Ex: "BOTAO:3\n")
+                snprintf(msg_tcp, sizeof(msg_tcp), "BOTAO:%d\n", botao_atual);
+                
+                // Envia imediatamente utilizando a infraestrutura do wifi_tcp_mgr
+                // (Como configuramos TCP_NODELAY, o sinal sairá sem buffer)
+                wifi_tcp_send_raw(msg_tcp);
+            }
+        }
+        
+        // Polling rápido de 30ms (Ideal para jogos sem sobrecarregar a CPU)
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
 }
 
