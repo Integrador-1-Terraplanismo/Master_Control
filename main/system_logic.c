@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h" // ADICIONADO: Biblioteca para a Fila
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "freertos/timers.h"
@@ -18,12 +19,19 @@
 static const char *TAG = "SYSTEM_LOGIC";
 static TimerHandle_t leitura_timer = NULL;
 
+// ADICIONADO: Handle da Fila para passar os UIDs da task NFC para a task Lógica
+static QueueHandle_t nfc_queue = NULL;
+
 static system_state_t current_state = STATE_IDLE;
 static char requested_planet[32] = "";
 static char target_record_planet[32] = "";
 static int failed_attempts = 0;
 static uint8_t last_serialized_uid[5] = {0};
 static bool keyboard_via_tcp = false;
+
+static void string_to_uppercase(char *str);
+static void finish_nfc_search(bool success);
+static bool find_planet_by_uid(const char *uid_str, char *found_name, size_t max_len);
 
 system_state_t system_logic_get_state(void) {
     return current_state;
@@ -53,6 +61,84 @@ static bool system_is_idle_for_tests(void) {
     return current_state == STATE_IDLE;
 }
 
+// ADICIONADO: Tarefa que vai processar os motores e lógicas de forma assíncrona
+static void logic_actuation_task(void *pvParameters) {
+    uint8_t uid[5];
+
+    while (1) {
+        // Fica aguardando infinitamente até receber um UID na fila
+        if (xQueueReceive(nfc_queue, &uid, portMAX_DELAY)) {
+            char uid_str[20];
+            snprintf(uid_str, sizeof(uid_str), "%02X%02X%02X%02X", uid[0], uid[1], uid[2], uid[3]);
+
+            if (current_state == STATE_RECORD_WAIT_NFC) {
+                if (memcmp(last_serialized_uid, uid, 4) == 0) {
+                    continue; // Pula para a próxima iteração do loop
+                }
+                memcpy(last_serialized_uid, uid, 4);
+
+                led_ctrl_set_state(true);
+                storage_save_planet(target_record_planet, uid_str);
+                printf("\n[GRAVADO] Tag %s -> planeta %s\n", uid_str, target_record_planet);
+                printf("Aproxime outra tag ou envie 'END'/'PROXIMO'.\n");
+                fflush(stdout);
+
+                vTaskDelay(pdMS_TO_TICKS(500));
+                led_ctrl_set_state(false);
+                continue;
+            }
+
+            if (current_state != STATE_READING_NFC || requested_planet[0] == '\0') {
+                continue;
+            }
+
+            char detected_planet_name[32] = "";
+            // Nota: certifique-se de que find_planet_by_uid esteja implementada ou acessível acima
+            // Vamos assumir que ela existe no seu código completo como static
+            bool found = find_planet_by_uid(uid_str, detected_planet_name, sizeof(detected_planet_name));
+
+            if (found) {
+                // string_to_uppercase já deve estar definida acima
+                string_to_uppercase(detected_planet_name);
+
+                if (strcmp(detected_planet_name, requested_planet) == 0) {
+                    printf("\n[NFC OK] Tag %s confirmada para %s\n", uid_str, detected_planet_name);
+                    fflush(stdout);
+
+                    tcp_send_reply(TCP_REPLY_RECD);
+                    servo_set_angle(SERVO_1, 0);
+                    servo_set_angle(SERVO_2, 0);
+                    led_ctrl_set_state(true);
+                    
+                    // ESTE DELAY AGORA NÃO TRAVA MAIS O NFC!
+                    vTaskDelay(pdMS_TO_TICKS(2000)); 
+                    
+                    servo_set_angle(SERVO_1, 90);
+                    servo_set_angle(SERVO_2, 90);
+                    led_ctrl_set_state(false);
+                    finish_nfc_search(true);
+                    continue;
+                }
+
+                tcp_send_reply(TCP_REPLY_NRECD);
+                failed_attempts++;
+            } else {
+                tcp_send_reply(TCP_REPLY_NPLT);
+                failed_attempts++;
+            }
+
+            if (failed_attempts >= 3) {
+                printf("\n[BLOQUEIO] 3 tentativas falhas para %s\n", requested_planet);
+                fflush(stdout);
+                finish_nfc_search(false);
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(1500));
+        }
+    }
+}
+
+// CORRIGIDO: Inicialização agora cria a Fila e a Task
 void system_logic_init(void) {
     leitura_timer = xTimerCreate(
         "LeituraTimeoutTimer",
@@ -65,6 +151,15 @@ void system_logic_init(void) {
     if (leitura_timer == NULL) {
         ESP_LOGE(TAG, "Falha ao alocar timer de leitura NFC.");
     }
+
+    // Cria a fila capaz de segurar até 5 UIDs lidos em sequência rápida
+    nfc_queue = xQueueCreate(5, sizeof(uint8_t) * 5);
+    if (nfc_queue == NULL) {
+        ESP_LOGE(TAG, "Falha ao criar fila do NFC.");
+    }
+
+    // Inicia a tarefa que moverá os servos e controlará os delays
+    xTaskCreate(logic_actuation_task, "logic_task", 4096, NULL, 5, NULL);
 }
 
 static void string_to_uppercase(char *str) {
@@ -463,67 +558,12 @@ void process_pc_command(const char *command, char *response_buffer, size_t max_r
     snprintf(response_buffer, max_resp_len, "COMANDO_INVALIDO\n");
 }
 
+// CORRIGIDO: Agora essa função apenas joga o dado na fila, liberando o Leitor NFC na hora.
 void handle_nfc_detection(uint8_t *uid) {
-    char uid_str[20];
-    snprintf(uid_str, sizeof(uid_str), "%02X%02X%02X%02X", uid[0], uid[1], uid[2], uid[3]);
-
-    if (current_state == STATE_RECORD_WAIT_NFC) {
-        if (memcmp(last_serialized_uid, uid, 4) == 0) {
-            return;
-        }
-        memcpy(last_serialized_uid, uid, 4);
-
-        led_ctrl_set_state(true);
-        storage_save_planet(target_record_planet, uid_str);
-        printf("\n[GRAVADO] Tag %s -> planeta %s\n", uid_str, target_record_planet);
-        printf("Aproxime outra tag ou envie 'END'/'PROXIMO'.\n");
-        fflush(stdout);
-
-        vTaskDelay(pdMS_TO_TICKS(500));
-        led_ctrl_set_state(false);
-        return;
+    if (nfc_queue != NULL) {
+        // Envia o array de 5 bytes do UID para a fila e segue o jogo. 
+        xQueueSend(nfc_queue, uid, 0);
     }
-
-    if (current_state != STATE_READING_NFC || requested_planet[0] == '\0') {
-        return;
-    }
-
-    char detected_planet_name[32] = "";
-    bool found = find_planet_by_uid(uid_str, detected_planet_name, sizeof(detected_planet_name));
-
-    if (found) {
-        string_to_uppercase(detected_planet_name);
-
-        if (strcmp(detected_planet_name, requested_planet) == 0) {
-            printf("\n[NFC OK] Tag %s confirmada para %s\n", uid_str, detected_planet_name);
-            fflush(stdout);
-
-            tcp_send_reply(TCP_REPLY_RECD);
-            servo_set_angle(SERVO_1, 0);
-            servo_set_angle(SERVO_2, 0);
-            led_ctrl_set_state(true);
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            servo_set_angle(SERVO_1, 90);
-            servo_set_angle(SERVO_2, 90);
-            led_ctrl_set_state(false);
-            finish_nfc_search(true);
-            return;
-        }
-
-        tcp_send_reply(TCP_REPLY_NRECD);
-        failed_attempts++;
-    } else {
-        tcp_send_reply(TCP_REPLY_NPLT);
-        failed_attempts++;
-    }
-
-    if (failed_attempts >= 3) {
-        printf("\n[BLOQUEIO] 3 tentativas falhas para %s\n", requested_planet);
-        fflush(stdout);
-        finish_nfc_search(false);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1500));
 }
 
 void serial_monitor_task(void *pvParameters) {
@@ -727,4 +767,4 @@ void iniciar_timer_leitura(void) {
     if (leitura_timer != NULL) {
         xTimerStart(leitura_timer, 0);
     }
-}
+}   
