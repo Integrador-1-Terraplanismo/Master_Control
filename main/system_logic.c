@@ -3,7 +3,7 @@
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h" // ADICIONADO: Biblioteca para a Fila
+#include "freertos/queue.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "freertos/timers.h"
@@ -13,13 +13,10 @@
 #include "servo_ctrl.h"
 #include "wifi_tcp_mgr.h"
 #include "storage_mgr.h"
-#include "button_matrix.h"
 #include "nfc_reader.h"
 
 static const char *TAG = "SYSTEM_LOGIC";
 static TimerHandle_t leitura_timer = NULL;
-
-// ADICIONADO: Handle da Fila para passar os UIDs da task NFC para a task Lógica
 static QueueHandle_t nfc_queue = NULL;
 
 static system_state_t current_state = STATE_IDLE;
@@ -27,11 +24,18 @@ static char requested_planet[32] = "";
 static char target_record_planet[32] = "";
 static int failed_attempts = 0;
 static uint8_t last_serialized_uid[5] = {0};
-static bool keyboard_via_tcp = false;
+static bool test_nfc_servo_mode = false;
 
+// Protótipos das funções estáticas para evitar erros de declaração implícita
 static void string_to_uppercase(char *str);
+static void stop_leitura_timer(void);
 static void finish_nfc_search(bool success);
 static bool find_planet_by_uid(const char *uid_str, char *found_name, size_t max_len);
+static void logic_actuation_task(void *pvParameters);
+static void run_isolated_servo_test(int servo_num);
+static void run_pair_servo_test(int servo_a, int servo_b);
+static bool system_is_busy_for_pc(void);
+static bool system_is_idle_for_tests(void);
 
 system_state_t system_logic_get_state(void) {
     return current_state;
@@ -43,8 +47,6 @@ const char *system_logic_state_name(system_state_t state) {
         case STATE_RECORD_GET_PLANET: return "GRAVACAO_NOME";
         case STATE_RECORD_WAIT_NFC: return "GRAVACAO_NFC";
         case STATE_READING_NFC: return "LEITURA_NFC";
-        case STATE_MINIGAME: return "MINIGAME";
-        case STATE_KEYBOARD: return "TECLADO";
         default: return "DESCONHECIDO";
     }
 }
@@ -52,28 +54,59 @@ const char *system_logic_state_name(system_state_t state) {
 static bool system_is_busy_for_pc(void) {
     return current_state == STATE_RECORD_GET_PLANET ||
            current_state == STATE_RECORD_WAIT_NFC ||
-           current_state == STATE_READING_NFC ||
-           current_state == STATE_MINIGAME ||
-           current_state == STATE_KEYBOARD;
+           current_state == STATE_READING_NFC;
 }
 
 static bool system_is_idle_for_tests(void) {
     return current_state == STATE_IDLE;
 }
 
-// ADICIONADO: Tarefa que vai processar os motores e lógicas de forma assíncrona
+void system_logic_init(void) {
+    leitura_timer = xTimerCreate(
+        "LeituraTimeoutTimer",
+        pdMS_TO_TICKS(30000),
+        pdFALSE,
+        (void *)0,
+        leitura_timeout_callback
+    );
+
+    if (leitura_timer == NULL) {
+        ESP_LOGE(TAG, "Falha ao alocar timer de leitura NFC.");
+    }
+
+    // Criação da fila para desacoplar a leitura NFC da atuação dos servos
+    nfc_queue = xQueueCreate(5, sizeof(uint8_t) * 5);
+    if (nfc_queue == NULL) {
+        ESP_LOGE(TAG, "Falha ao criar fila do NFC.");
+    }
+
+    // Task que processará a lógica de rotação e os tempos de espera de forma estável
+    xTaskCreate(logic_actuation_task, "logic_task", 4096, NULL, 5, NULL);
+}
+
+// Tarefa Assíncrona de Processamento e Atuação
 static void logic_actuation_task(void *pvParameters) {
     uint8_t uid[5];
 
     while (1) {
-        // Fica aguardando infinitamente até receber um UID na fila
         if (xQueueReceive(nfc_queue, &uid, portMAX_DELAY)) {
             char uid_str[20];
             snprintf(uid_str, sizeof(uid_str), "%02X%02X%02X%02X", uid[0], uid[1], uid[2], uid[3]);
 
+            // Modo de Teste Combinado: NFC + Servo Direto
+            if (test_nfc_servo_mode) {
+                printf("\n[TESTE NFC+SERVO] Tag detectada: %s! Movendo SERVO_1...\n", uid_str);
+                fflush(stdout);
+                servo_set_angle(SERVO_1, 0);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                servo_set_angle(SERVO_1, 90);
+                continue;
+            }
+
+            // Modo de Gravação de Tags
             if (current_state == STATE_RECORD_WAIT_NFC) {
                 if (memcmp(last_serialized_uid, uid, 4) == 0) {
-                    continue; // Pula para a próxima iteração do loop
+                    continue;
                 }
                 memcpy(last_serialized_uid, uid, 4);
 
@@ -88,29 +121,26 @@ static void logic_actuation_task(void *pvParameters) {
                 continue;
             }
 
+            // Modo de Validação e Leitura Real (Transmissão para o Cliente)
             if (current_state != STATE_READING_NFC || requested_planet[0] == '\0') {
                 continue;
             }
 
             char detected_planet_name[32] = "";
-            // Nota: certifique-se de que find_planet_by_uid esteja implementada ou acessível acima
-            // Vamos assumir que ela existe no seu código completo como static
             bool found = find_planet_by_uid(uid_str, detected_planet_name, sizeof(detected_planet_name));
 
             if (found) {
-                // string_to_uppercase já deve estar definida acima
                 string_to_uppercase(detected_planet_name);
 
                 if (strcmp(detected_planet_name, requested_planet) == 0) {
                     printf("\n[NFC OK] Tag %s confirmada para %s\n", uid_str, detected_planet_name);
                     fflush(stdout);
 
-                    tcp_send_reply(TCP_REPLY_RECD);
+                    tcp_send_reply(TCP_REPLY_RECD); // Envia confirmação via TCP para o PC
                     servo_set_angle(SERVO_1, 0);
                     servo_set_angle(SERVO_2, 0);
                     led_ctrl_set_state(true);
                     
-                    // ESTE DELAY AGORA NÃO TRAVA MAIS O NFC!
                     vTaskDelay(pdMS_TO_TICKS(2000)); 
                     
                     servo_set_angle(SERVO_1, 90);
@@ -138,30 +168,6 @@ static void logic_actuation_task(void *pvParameters) {
     }
 }
 
-// CORRIGIDO: Inicialização agora cria a Fila e a Task
-void system_logic_init(void) {
-    leitura_timer = xTimerCreate(
-        "LeituraTimeoutTimer",
-        pdMS_TO_TICKS(30000),
-        pdFALSE,
-        (void *)0,
-        leitura_timeout_callback
-    );
-
-    if (leitura_timer == NULL) {
-        ESP_LOGE(TAG, "Falha ao alocar timer de leitura NFC.");
-    }
-
-    // Cria a fila capaz de segurar até 5 UIDs lidos em sequência rápida
-    nfc_queue = xQueueCreate(5, sizeof(uint8_t) * 5);
-    if (nfc_queue == NULL) {
-        ESP_LOGE(TAG, "Falha ao criar fila do NFC.");
-    }
-
-    // Inicia a tarefa que moverá os servos e controlará os delays
-    xTaskCreate(logic_actuation_task, "logic_task", 4096, NULL, 5, NULL);
-}
-
 static void string_to_uppercase(char *str) {
     for (int i = 0; str[i]; i++) {
         str[i] = (char)toupper((unsigned char)str[i]);
@@ -183,7 +189,6 @@ static void finish_nfc_search(bool success) {
     if (!success) {
         servo_set_angle(SERVO_1, 180);
         servo_set_angle(SERVO_2, 180);
-        led_ctrl_set_state(false);
         vTaskDelay(pdMS_TO_TICKS(2000));
         servo_set_angle(SERVO_1, 90);
         servo_set_angle(SERVO_2, 90);
@@ -208,217 +213,36 @@ static bool find_planet_by_uid(const char *uid_str, char *found_name, size_t max
     return false;
 }
 
-static void run_servo_test_sequence(void) {
-    servo_set_angle(SERVO_1, 90);
-    servo_set_angle(SERVO_2, 90);
-    vTaskDelay(pdMS_TO_TICKS(1500));
-
-    servo_set_angle(SERVO_1, 180);
-    servo_set_angle(SERVO_2, 180);
-    vTaskDelay(pdMS_TO_TICKS(1500));
-
-    servo_set_angle(SERVO_1, 0);
-    servo_set_angle(SERVO_2, 0);
-    vTaskDelay(pdMS_TO_TICKS(1500));
-
-    servo_set_angle(SERVO_3, 90);
-    servo_set_angle(SERVO_4, 90);
-    vTaskDelay(pdMS_TO_TICKS(1500));
-
-    servo_set_angle(SERVO_3, 180);
-    servo_set_angle(SERVO_4, 180);
-    vTaskDelay(pdMS_TO_TICKS(1500));
-
-    servo_set_angle(SERVO_3, 0);
-    servo_set_angle(SERVO_4, 0);
-    vTaskDelay(pdMS_TO_TICKS(1500));
-}
-
-static void run_led_test_sequence(void) {
-    led_ctrl_send_command(IR_CMD_ON);
+// Funções de Testes Individuais e em Par
+static void run_isolated_servo_test(int servo_num) {
+    printf("[TESTE] A mover Servo %d isolado...\n", servo_num);
+    servo_set_angle(servo_num, 0);
     vTaskDelay(pdMS_TO_TICKS(1000));
-    led_ctrl_send_command(IR_CMD_RED);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    led_ctrl_send_command(IR_CMD_GREEN);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    led_ctrl_send_command(IR_CMD_BLUE);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    led_ctrl_send_command(IR_CMD_OFF);
-    vTaskDelay(pdMS_TO_TICKS(500));
+    servo_set_angle(servo_num, 180);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    servo_set_angle(servo_num, 90);
 }
 
-static void print_keyboard_help(void) {
-    printf("\n=== MODO TECLADO (NOME) ===\n");
-    printf("Botao 1: Letra anterior\n");
-    printf("Botao 2: Proxima letra\n");
-    printf("Botao 3: Confirmar letra\n");
-    printf("Botao 4: Apagar ultima letra\n");
-    printf("Botao 5: ENTER (enviar nome)\n");
-    printf("============================\n\n");
+static void run_pair_servo_test(int servo_a, int servo_b) {
+    printf("[TESTE] A mover Par de Servos %d e %d em simultaneo...\n", servo_a, servo_b);
+    servo_set_angle(servo_a, 0);
+    servo_set_angle(servo_b, 0);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    servo_set_angle(servo_a, 180);
+    servo_set_angle(servo_b, 180);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    servo_set_angle(servo_a, 90);
+    servo_set_angle(servo_b, 90);
 }
 
-static void print_keyboard_status(const keyboard_state_t *kb) {
-    printf("[TECLADO] Letra:%c | Nome:%s%s\n",
-           kb->cursor_letter,
-           kb->buffer,
-           kb->length == 0 ? "(vazio)" : "");
-    fflush(stdout);
-}
-
-static void send_keyboard_event(const char *event_line) {
-    wifi_tcp_send_raw(event_line);
-}
-
-static void handle_keyboard_event(keyboard_state_t *kb, keyboard_event_t evt, bool via_tcp) {
-    char line[64];
-
-    switch (evt) {
-        case KB_EVT_CURSOR_CHANGED:
-            snprintf(line, sizeof(line), "TECLADO:CURSOR:%c\n", kb->cursor_letter);
-            if (via_tcp) send_keyboard_event(line);
-            else print_keyboard_status(kb);
-            break;
-
-        case KB_EVT_LETTER_ADDED:
-            snprintf(line, sizeof(line), "TECLADO:NOME:%s\n", kb->buffer);
-            if (via_tcp) send_keyboard_event(line);
-            else print_keyboard_status(kb);
-            break;
-
-        case KB_EVT_BACKSPACE:
-            snprintf(line, sizeof(line), "TECLADO:APAGOU:%s\n", kb->buffer);
-            if (via_tcp) send_keyboard_event(line);
-            else print_keyboard_status(kb);
-            break;
-
-        case KB_EVT_ENTER:
-            snprintf(line, sizeof(line), "TECLADO:ENTER:%s\n", kb->buffer);
-            if (via_tcp) send_keyboard_event(line);
-            else {
-                printf("\n[NOME CONFIRMADO] %s\n\n", kb->buffer);
-                fflush(stdout);
-            }
-            current_state = STATE_IDLE;
-            nfc_reader_start_reading();
-            break;
-
-        default:
-            break;
-    }
-}
-
-void executar_loop_teclado(void) {
-    keyboard_state_t kb;
-    button_keyboard_init(&kb);
-
-    print_keyboard_help();
-    print_keyboard_status(&kb);
-
-    while (current_state == STATE_KEYBOARD) {
-        button_id_t pressed = button_matrix_read_on_press();
-        if (pressed != BTN_NONE) {
-            keyboard_event_t evt = button_keyboard_handle(&kb, pressed);
-            handle_keyboard_event(&kb, evt, keyboard_via_tcp);
-        }
-        vTaskDelay(pdMS_TO_TICKS(30));
-    }
-
-    keyboard_via_tcp = false;
-}
-
-void executar_loop_minigame(void) {
-    button_id_t ultimo_botao = BTN_NONE;
-    char msg_tcp[32];
-
-    ESP_LOGI(TAG, "Loop do minigame iniciado.");
-
-    while (current_state == STATE_MINIGAME) {
-        button_id_t botao_atual = button_matrix_read();
-
-        if (botao_atual != ultimo_botao) {
-            ultimo_botao = botao_atual;
-
-            if (botao_atual != BTN_NONE) {
-                snprintf(msg_tcp, sizeof(msg_tcp), "BOTAO:%d:%s\n",
-                         botao_atual, button_matrix_label(botao_atual));
-                wifi_tcp_send_raw(msg_tcp);
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(30));
-    }
-}
-
-static void run_button_monitor_test(int duration_ms, bool via_tcp) {
-    button_id_t ultimo_botao = BTN_NONE;
-    int iterations = duration_ms / 50;
-
-    for (int i = 0; i < iterations; i++) {
-        button_id_t botao_atual = button_matrix_read();
-
-        if (botao_atual != ultimo_botao) {
-            ultimo_botao = botao_atual;
-
-            if (botao_atual != BTN_NONE) {
-                if (via_tcp) {
-                    char line[48];
-                    snprintf(line, sizeof(line), "TESTE_BOTOES:%d:%s\n",
-                             botao_atual, button_matrix_label(botao_atual));
-                    wifi_tcp_send_raw(line);
-                } else {
-                    printf("[BOTOES] Botao %d (%s) | ADC=%d\n",
-                           botao_atual, button_matrix_label(botao_atual),
-                           button_matrix_read_raw());
-                    fflush(stdout);
-                }
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-}
-
-static int run_nfc_scan_test(int duration_ms, bool via_tcp) {
-    bool was_reading = nfc_reader_is_reading();
-    if (was_reading) {
-        nfc_reader_stop_reading();
-    }
-
-    int tags_found = 0;
-    int iterations = duration_ms / 300;
-    char uid[20];
-
-    for (int i = 0; i < iterations; i++) {
-        if (nfc_reader_scan_once(uid, sizeof(uid))) {
-            tags_found++;
-            if (via_tcp) {
-                char line[48];
-                snprintf(line, sizeof(line), "TESTE_NFC:TAG:%s\n", uid);
-                wifi_tcp_send_raw(line);
-            } else {
-                printf("[NFC] Tag detectada: %s\n", uid);
-                fflush(stdout);
-            }
-            vTaskDelay(pdMS_TO_TICKS(1200));
-        }
-        vTaskDelay(pdMS_TO_TICKS(300));
-    }
-
-    if (was_reading) {
-        nfc_reader_start_reading();
-    }
-
-    return tags_found;
-}
-
+// Processamento de Comandos vindos do PC (Wi-Fi TCP)
 void process_pc_command(const char *command, char *response_buffer, size_t max_resp_len) {
     char cmd_copy[64];
     strncpy(cmd_copy, command, sizeof(cmd_copy) - 1);
     cmd_copy[sizeof(cmd_copy) - 1] = '\0';
     cmd_copy[strcspn(cmd_copy, "\r\n")] = 0;
 
-    if (system_is_busy_for_pc() &&
-        strncmp(cmd_copy, "FIM_", 4) != 0 &&
-        strcmp(cmd_copy, "STATUS") != 0) {
+    if (system_is_busy_for_pc() && strcmp(cmd_copy, "STATUS") != 0) {
         snprintf(response_buffer, max_resp_len, "ERRO:ESP32 Ocupado\n");
         tcp_send_reply(TCP_REPLY_BUSY);
         return;
@@ -429,7 +253,6 @@ void process_pc_command(const char *command, char *response_buffer, size_t max_r
             snprintf(response_buffer, max_resp_len, "ERRO:ESP32 Ocupado\n");
             return;
         }
-
         strncpy(requested_planet, cmd_copy + 6, sizeof(requested_planet) - 1);
         requested_planet[sizeof(requested_planet) - 1] = '\0';
         string_to_uppercase(requested_planet);
@@ -439,112 +262,63 @@ void process_pc_command(const char *command, char *response_buffer, size_t max_r
         if (leitura_timer != NULL) {
             xTimerStart(leitura_timer, 0);
         }
-
         snprintf(response_buffer, max_resp_len, "BUSCANDO:%s\n", requested_planet);
         return;
     }
 
-    if (strcmp(cmd_copy, "TESTE_SERVO") == 0) {
-        if (!system_is_idle_for_tests()) {
-            snprintf(response_buffer, max_resp_len, "busy\n");
-            return;
-        }
-        run_servo_test_sequence();
-        snprintf(response_buffer, max_resp_len, "TESTE_SERVO_CONCLUIDO\n");
+    // Comandos de Testes Isolados de Servos
+    if (strcmp(cmd_copy, "TESTE_SERVO1") == 0) {
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        run_isolated_servo_test(SERVO_1);
+        snprintf(response_buffer, max_resp_len, "TESTE_SERVO1_CONCLUIDO\n");
+        return;
+    }
+    if (strcmp(cmd_copy, "TESTE_SERVO2") == 0) {
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        run_isolated_servo_test(SERVO_2);
+        snprintf(response_buffer, max_resp_len, "TESTE_SERVO2_CONCLUIDO\n");
+        return;
+    }
+    if (strcmp(cmd_copy, "TESTE_SERVO3") == 0) {
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        run_isolated_servo_test(SERVO_3);
+        snprintf(response_buffer, max_resp_len, "TESTE_SERVO3_CONCLUIDO\n");
+        return;
+    }
+    if (strcmp(cmd_copy, "TESTE_SERVO4") == 0) {
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        run_isolated_servo_test(SERVO_4);
+        snprintf(response_buffer, max_resp_len, "TESTE_SERVO4_CONCLUIDO\n");
         return;
     }
 
-    if (strcmp(cmd_copy, "TESTE_LED") == 0) {
-        if (!system_is_idle_for_tests()) {
-            snprintf(response_buffer, max_resp_len, "busy\n");
-            return;
-        }
-        run_led_test_sequence();
-        snprintf(response_buffer, max_resp_len, "TESTE_LED_CONCLUIDO\n");
+    // Comandos de Testes em Par
+    if (strcmp(cmd_copy, "TESTE_PAR12") == 0) {
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        run_pair_servo_test(SERVO_1, SERVO_2);
+        snprintf(response_buffer, max_resp_len, "TESTE_PAR12_CONCLUIDO\n");
+        return;
+    }
+    if (strcmp(cmd_copy, "TESTE_PAR34") == 0) {
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        run_pair_servo_test(SERVO_3, SERVO_4);
+        snprintf(response_buffer, max_resp_len, "TESTE_PAR34_CONCLUIDO\n");
         return;
     }
 
-    if (strcmp(cmd_copy, "TESTE_NFC") == 0) {
-        if (!system_is_idle_for_tests()) {
-            snprintf(response_buffer, max_resp_len, "busy\n");
-            return;
-        }
-        char report[96];
-        nfc_reader_self_test(report, sizeof(report));
-        snprintf(response_buffer, max_resp_len, "%s\n", report);
-        int found = run_nfc_scan_test(10000, true);
-        char suffix[48];
-        snprintf(suffix, sizeof(suffix), "TESTE_NFC:FIM:%d\n", found);
-        wifi_tcp_send_raw(suffix);
-        strncat(response_buffer, " | scan 10s iniciado\n", max_resp_len - strlen(response_buffer) - 1);
-        return;
-    }
-
-    if (strcmp(cmd_copy, "TESTE_BOTOES") == 0) {
-        if (!system_is_idle_for_tests()) {
-            snprintf(response_buffer, max_resp_len, "busy\n");
-            return;
-        }
-        snprintf(response_buffer, max_resp_len, "TESTE_BOTOES_INICIADO\n");
-        run_button_monitor_test(10000, true);
-        wifi_tcp_send_raw("TESTE_BOTOES:FIM\n");
-        return;
-    }
-
-    if (strcmp(cmd_copy, "TECLADO") == 0) {
-        if (!system_is_idle_for_tests()) {
-            snprintf(response_buffer, max_resp_len, "busy\n");
-            return;
-        }
-        current_state = STATE_KEYBOARD;
-        keyboard_via_tcp = true;
-        nfc_reader_stop_reading();
-        snprintf(response_buffer, max_resp_len, "TECLADO_START_ACK\n");
-        executar_loop_teclado();
-        return;
-    }
-
-    if (strcmp(cmd_copy, "FIM_TECLADO") == 0) {
-        if (current_state == STATE_KEYBOARD) {
-            current_state = STATE_IDLE;
-            nfc_reader_start_reading();
-            snprintf(response_buffer, max_resp_len, "TECLADO_ENCERRADO\n");
-        } else {
-            snprintf(response_buffer, max_resp_len, "ERRO:Modo teclado inativo\n");
-        }
-        return;
-    }
-
-    if (strcmp(cmd_copy, "MINIGAME") == 0) {
-        if (!system_is_idle_for_tests()) {
-            snprintf(response_buffer, max_resp_len, "busy\n");
-            return;
-        }
-        current_state = STATE_MINIGAME;
-        nfc_reader_stop_reading();
-        snprintf(response_buffer, max_resp_len, "MINIGAME_START_ACK\n");
-        executar_loop_minigame();
-        return;
-    }
-
-    if (strcmp(cmd_copy, "FIM_MINIGAME") == 0) {
-        if (current_state == STATE_MINIGAME) {
-            current_state = STATE_IDLE;
-            nfc_reader_start_reading();
-            snprintf(response_buffer, max_resp_len, "MODO_NORMAL_RESTABELECIDO\n");
-        } else {
-            snprintf(response_buffer, max_resp_len, "ERRO:Minigame inativo\n");
-        }
+    // Ativação do Modo Combinado NFC + Movimento de Servo
+    if (strcmp(cmd_copy, "TESTE_NFC_SERVO") == 0) {
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        test_nfc_servo_mode = !test_nfc_servo_mode;
+        snprintf(response_buffer, max_resp_len, "TESTE_NFC_SERVO:%s\n", test_nfc_servo_mode ? "ATIVADO" : "DESATIVADO");
         return;
     }
 
     if (strcmp(cmd_copy, "STATUS") == 0) {
         char nfc_report[96];
         nfc_reader_self_test(nfc_report, sizeof(nfc_report));
-        snprintf(response_buffer, max_resp_len,
-                 "STATUS:estado=%s,nfc=%s\n",
-                 system_logic_state_name(current_state),
-                 nfc_report);
+        snprintf(response_buffer, max_resp_len, "STATUS:estado=%s,nfc=%s,modo_combinado=%s\n",
+                 system_logic_state_name(current_state), nfc_report, test_nfc_servo_mode ? "ON" : "OFF");
         return;
     }
 
@@ -558,30 +332,30 @@ void process_pc_command(const char *command, char *response_buffer, size_t max_r
     snprintf(response_buffer, max_resp_len, "COMANDO_INVALIDO\n");
 }
 
-// CORRIGIDO: Agora essa função apenas joga o dado na fila, liberando o Leitor NFC na hora.
 void handle_nfc_detection(uint8_t *uid) {
     if (nfc_queue != NULL) {
-        // Envia o array de 5 bytes do UID para a fila e segue o jogo. 
-        xQueueSend(nfc_queue, uid, 0);
+        xQueueSend(nfc_queue, uid, 0); // Despacha imediatamente para a fila assíncrona
     }
 }
 
+// Monitoramento e Menu via Console Serial (UART)
 void serial_monitor_task(void *pvParameters) {
     uint8_t *data = (uint8_t *)malloc(BUF_SIZE);
 
-    printf("\n=== CONSOLE SERIAL PRONTO ===\n");
-    printf("GRAVAR      - mapear planetas NFC\n");
-    printf("LISTAR      - listar banco de dados\n");
-    printf("LIMPAR      - apagar planetas.txt\n");
-    printf("TECLADO     - digitar nome (5 botoes)\n");
-    printf("TESTE       - LED + servo rapido\n");
-    printf("TESTE_SERVO - teste completo dos servos\n");
-    printf("TESTE_LED   - teste fita IR\n");
-    printf("TESTE_NFC   - diagnostico + scan 15s\n");
-    printf("TESTE_BOTOES- monitor de botoes 10s\n");
-    printf("STATUS      - estado atual do sistema\n");
-    printf("AJUDA       - mostrar este menu\n");
-    printf("=============================\n\n");
+    printf("\n=== CONSOLE SERIAL (ESSENCIAL) ===\n");
+    printf("GRAVAR        - Mapear planetas NFC\n");
+    printf("LISTAR        - Listar base de dados (planetas)\n");
+    printf("LIMPAR        - Apagar planetas.txt\n");
+    printf("STATUS        - Estado atual do sistema\n");
+    printf("TESTE_SERVO1  - Testar Servo 1 isolado\n");
+    printf("TESTE_SERVO2  - Testar Servo 2 isolado\n");
+    printf("TESTE_SERVO3  - Testar Servo 3 isolado\n");
+    printf("TESTE_SERVO4  - Testar Servo 4 isolado\n");
+    printf("TESTE_PAR12   - Testar Par de Servos 1 e 2\n");
+    printf("TESTE_PAR34   - Testar Par de Servos 3 e 4\n");
+    printf("TESTE_NFC_SERVO - Alternar teste combinado NFC + Servo\n");
+    printf("END / PROXIMO - Controlo do fluxo de gravacao\n");
+    printf("==================================\n\n");
 
     while (1) {
         int len = uart_read_bytes(EX_UART_NUM, data, BUF_SIZE - 1, pdMS_TO_TICKS(100));
@@ -591,16 +365,11 @@ void serial_monitor_task(void *pvParameters) {
             input[strcspn(input, "\r\n")] = 0;
             string_to_uppercase(input);
 
-            if (strcmp(input, "AJUDA") == 0 || strcmp(input, "HELP") == 0) {
-                printf("\nComandos: GRAVAR LISTAR LIMPAR TECLADO END PROXIMO\n");
-                printf("Testes: TESTE TESTE_SERVO TESTE_LED TESTE_NFC TESTE_BOTOES STATUS\n\n");
-                continue;
-            }
-
             if (strcmp(input, "STATUS") == 0) {
                 char report[96];
                 nfc_reader_self_test(report, sizeof(report));
-                printf("\nEstado: %s\n%s\n\n", system_logic_state_name(current_state), report);
+                printf("\nEstado: %s | Modo Combinado NFC+Servo: %s\n%s\n\n", 
+                       system_logic_state_name(current_state), test_nfc_servo_mode ? "ON" : "OFF", report);
                 continue;
             }
 
@@ -611,114 +380,25 @@ void serial_monitor_task(void *pvParameters) {
                 continue;
             }
 
-            if (strcmp(input, "TESTE_BOTOES") == 0) {
-                if (system_is_idle_for_tests()) {
-                    printf("\n[TESTE_BOTOES] Monitor 10s (ADC + rotulo)\n");
-                    run_button_monitor_test(10000, false);
-                    printf("[TESTE_BOTOES] Fim.\n\n");
-                } else {
-                    printf("\nSistema ocupado.\n");
-                }
-                continue;
-            }
-
-            if (strcmp(input, "TESTE_SERVO") == 0) {
-                if (system_is_idle_for_tests()) {
-                    printf("\n[TESTE_SERVO] Iniciando...\n");
-                    run_servo_test_sequence();
-                    printf("[TESTE_SERVO] Concluido.\n\n");
-                } else {
-                    printf("\nSistema ocupado.\n");
-                }
-                continue;
-            }
-
-            if (strcmp(input, "TESTE_LED") == 0) {
-                if (system_is_idle_for_tests()) {
-                    printf("\n[TESTE_LED] Sequencia IR...\n");
-                    run_led_test_sequence();
-                    printf("[TESTE_LED] Concluido.\n\n");
-                } else {
-                    printf("\nSistema ocupado.\n");
-                }
-                continue;
-            }
-
-            if (strcmp(input, "TESTE_NFC") == 0) {
-                if (system_is_idle_for_tests()) {
-                    char report[96];
-                    nfc_reader_self_test(report, sizeof(report));
-                    printf("\n[TESTE_NFC] %s\n", report);
-                    printf("Aproxime tags por 15 segundos...\n");
-                    int found = run_nfc_scan_test(15000, false);
-                    printf("[TESTE_NFC] Fim. Tags unicas: %d\n\n", found);
-                } else {
-                    printf("\nSistema ocupado.\n");
-                }
-                continue;
-            }
-
-            if (strcmp(input, "TECLADO") == 0) {
-                if (system_is_idle_for_tests()) {
-                    current_state = STATE_KEYBOARD;
-                    keyboard_via_tcp = false;
-                    nfc_reader_stop_reading();
-                    executar_loop_teclado();
-                } else {
-                    printf("\nSistema ocupado.\n");
-                }
-                continue;
-            }
-
-            if (strcmp(input, "END") == 0) {
-                if (current_state != STATE_IDLE) {
-                    current_state = STATE_IDLE;
-                    target_record_planet[0] = '\0';
-                    requested_planet[0] = '\0';
-                    memset(last_serialized_uid, 0, sizeof(last_serialized_uid));
-                    stop_leitura_timer();
-                    nfc_reader_start_reading();
-                    printf("\nModo normal restaurado.\n");
-                } else {
-                    printf("\nJa esta no modo normal.\n");
-                }
-                continue;
-            }
-
             if (strcmp(input, "LIMPAR") == 0) {
-                if (system_is_idle_for_tests()) {
-                    storage_clear_all();
-                    printf("\nBanco de dados limpo.\n");
-                } else {
-                    printf("\nSistema ocupado.\n");
-                }
+                if (system_is_idle_for_tests()) { storage_clear_all(); printf("\nBase de dados limpa.\n"); }
+                else { printf("\nSistema ocupado.\n"); }
                 continue;
             }
 
-            if (strcmp(input, "TESTE") == 0) {
-                if (system_is_idle_for_tests()) {
-                    printf("\n[TESTE] LED + Servo 1...\n");
-                    run_led_test_sequence();
-                    servo_set_angle(SERVO_1, 90);
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    servo_set_angle(SERVO_1, 180);
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    servo_set_angle(SERVO_1, 0);
-                    printf("[TESTE] Concluido.\n\n");
-                } else {
-                    printf("\nSistema ocupado.\n");
-                }
+            if (strncmp(input, "TESTE_SERVO", 11) == 0 || strncmp(input, "TESTE_PAR", 9) == 0 || strcmp(input, "TESTE_NFC_SERVO") == 0) {
+                char resp[128];
+                process_pc_command(input, resp, sizeof(resp));
+                printf("\n%s", resp);
                 continue;
             }
 
             if (strcmp(input, "GRAVAR") == 0) {
                 if (system_is_idle_for_tests()) {
                     current_state = STATE_RECORD_GET_PLANET;
-                    printf("\n[MODO GRAVACAO] Digite o nome do planeta: ");
+                    printf("\n[MODO GRAVACAO] Introduza o nome do planeta: ");
                     fflush(stdout);
-                } else {
-                    printf("\nSistema ocupado.\n");
-                }
+                } else { printf("\nSistema ocupado.\n"); }
                 continue;
             }
 
@@ -727,10 +407,21 @@ void serial_monitor_task(void *pvParameters) {
                     current_state = STATE_RECORD_GET_PLANET;
                     target_record_planet[0] = '\0';
                     memset(last_serialized_uid, 0, sizeof(last_serialized_uid));
-                    printf("\nDigite o nome do proximo planeta: ");
+                    printf("\nIntroduza o nome do proximo planeta: ");
                     fflush(stdout);
-                } else {
-                    printf("\n'PROXIMO' so funciona durante gravacao NFC.\n");
+                } else { printf("\n'PROXIMO' so funciona durante a gravacao NFC.\n"); }
+                continue;
+            }
+
+            if (strcmp(input, "END") == 0) {
+                if (current_state != STATE_IDLE || test_nfc_servo_mode) {
+                    current_state = STATE_IDLE;
+                    test_nfc_servo_mode = false;
+                    target_record_planet[0] = '\0';
+                    requested_planet[0] = '\0';
+                    memset(last_serialized_uid, 0, sizeof(last_serialized_uid));
+                    stop_leitura_timer();
+                    printf("\nModo normal restaurado (Testes desativados).\n");
                 }
                 continue;
             }
@@ -743,7 +434,7 @@ void serial_monitor_task(void *pvParameters) {
                     memset(last_serialized_uid, 0, sizeof(last_serialized_uid));
                     printf("\nPlaneta: %s\nAproxime as tags NFC...\n", target_record_planet);
                 } else if (current_state == STATE_IDLE) {
-                    printf("\nComando desconhecido. Digite AJUDA.\n");
+                    printf("\nComando desconhecido.\n");
                 }
             }
         }
@@ -767,4 +458,4 @@ void iniciar_timer_leitura(void) {
     if (leitura_timer != NULL) {
         xTimerStart(leitura_timer, 0);
     }
-}   
+}
