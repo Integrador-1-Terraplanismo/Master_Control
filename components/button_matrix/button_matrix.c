@@ -15,7 +15,7 @@ void button_matrix_init(void) {
 
     adc_oneshot_chan_cfg_t config = {
         .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten = ADC_ATTEN_DB_12,
+        .atten = ADC_ATTEN_DB_11,
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, BUTTON_ADC_CHANNEL, &config));
     ESP_LOGI(TAG, "Teclado analogico inicializado no GPIO 32.");

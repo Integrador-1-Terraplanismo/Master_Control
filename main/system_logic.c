@@ -137,14 +137,9 @@ static void logic_actuation_task(void *pvParameters) {
                     fflush(stdout);
 
                     tcp_send_reply(TCP_REPLY_RECD); // Envia confirmação via TCP para o PC
-                    servo_set_angle(SERVO_1, 0);
-                    servo_set_angle(SERVO_2, 0);
+                    //trocar o codigo abaixo caso servos não atuem de maneira correta
                     led_ctrl_set_state(true);
-                    
-                    vTaskDelay(pdMS_TO_TICKS(2000)); 
-                    
-                    servo_set_angle(SERVO_1, 90);
-                    servo_set_angle(SERVO_2, 90);
+                    run_pair_servo_open(SERVO_3, SERVO_4);
                     led_ctrl_set_state(false);
                     finish_nfc_search(true);
                     continue;
@@ -159,6 +154,8 @@ static void logic_actuation_task(void *pvParameters) {
 
             if (failed_attempts >= 3) {
                 printf("\n[BLOQUEIO] 3 tentativas falhas para %s\n", requested_planet);
+                //add cod para remover o planeta da tampa
+                run_pair_servo_tira(SERVO_3, SERVO_4);
                 fflush(stdout);
                 finish_nfc_search(false);
             }
@@ -223,6 +220,8 @@ static void run_isolated_servo_test(int servo_num) {
     servo_set_angle(servo_num, 90);
 }
 
+
+
 static void run_pair_servo_test(int servo_a, int servo_b) {
     printf("[TESTE] A mover Par de Servos %d e %d em simultaneo...\n", servo_a, servo_b);
     servo_set_angle(servo_a, 0);
@@ -234,6 +233,36 @@ static void run_pair_servo_test(int servo_a, int servo_b) {
     servo_set_angle(servo_a, 90);
     servo_set_angle(servo_b, 90);
 }
+
+static void run_pair_servo_inverse_test(int servo_a, int servo_b) {
+    printf("[TESTE] A mover Par de Servos %d e %d em direcoes opostas...\n", servo_a, servo_b);
+    servo_set_angle(servo_a, 0);
+    servo_set_angle(servo_b, 180);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    servo_set_angle(servo_a, 180);
+    servo_set_angle(servo_b, 0);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    servo_set_angle(servo_a, 90);
+    servo_set_angle(servo_b, 90);
+}   
+
+static void run_pair_servo_open(int servo_a, int servo_b) {
+    printf("[TESTE] A mover Par de Servos %d e %d em direcoes opostas...\n", servo_a, servo_b);
+    servo_set_angle(servo_a, 0);
+    servo_set_angle(servo_b, 180);
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    servo_set_angle(servo_a, 90);
+    servo_set_angle(servo_b, 90);
+}   
+
+static void run_pair_servo_tira(int servo_a, int servo_b) {
+    printf("[TESTE] A mover Par de Servos %d e %d em direcoes opostas...\n", servo_a, servo_b);
+    servo_set_angle(servo_a, 180);
+    servo_set_angle(servo_b, 0);
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    servo_set_angle(servo_a, 90);
+    servo_set_angle(servo_b, 90);
+} 
 
 // Processamento de Comandos vindos do PC (Wi-Fi TCP)
 void process_pc_command(const char *command, char *response_buffer, size_t max_resp_len) {
@@ -305,7 +334,31 @@ void process_pc_command(const char *command, char *response_buffer, size_t max_r
         snprintf(response_buffer, max_resp_len, "TESTE_PAR34_CONCLUIDO\n");
         return;
     }
-
+    if (strcmp(cmd_copy, "TESTE_PAR_INVERSO12") == 0) {
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        run_pair_servo_inverse_test(SERVO_1, SERVO_2);
+        snprintf(response_buffer, max_resp_len, "TESTE_PAR_INVERSO12_CONCLUIDO\n");
+        return;
+    }
+    if (strcmp(cmd_copy, "TESTE_PAR_INVERSO34") == 0) {
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        run_pair_servo_inverse_test(SERVO_3, SERVO_4);
+        snprintf(response_buffer, max_resp_len, "TESTE_PAR_INVERSO34_CONCLUIDO\n");
+        return;
+    }
+    if (strcmp(cmd_copy, "OPEN") == 0){
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        run_pair_servo_open(SERVO_3, SERVO_4);
+        snprintf(response_buffer, max_resp_len, "TESTE_PAR_OPEN_CONCLUIDO\n");
+        return;
+    }
+    if (strcmp(cmd_copy, "TIRA") == 0){
+        if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
+        run_pair_servo_tira(SERVO_3, SERVO_4);
+        snprintf(response_buffer, max_resp_len, "TESTE_PAR_TIRA_CONCLUIDO\n");
+        return;
+    }
+    
     // Ativação do Modo Combinado NFC + Movimento de Servo
     if (strcmp(cmd_copy, "TESTE_NFC_SERVO") == 0) {
         if (!system_is_idle_for_tests()) { snprintf(response_buffer, max_resp_len, "busy\n"); return; }
@@ -386,7 +439,8 @@ void serial_monitor_task(void *pvParameters) {
                 continue;
             }
 
-            if (strncmp(input, "TESTE_SERVO", 11) == 0 || strncmp(input, "TESTE_PAR", 9) == 0 || strcmp(input, "TESTE_NFC_SERVO") == 0) {
+            if (strncmp(input, "TESTE_SERVO", 11) == 0 || strncmp(input, "TESTE_PAR", 9) == 0 ||
+                strcmp(input, "TESTE_NFC_SERVO") == 0 || strcmp(input, "OPEN") == 0 || strcmp(input, "TIRA") == 0) {
                 char resp[128];
                 process_pc_command(input, resp, sizeof(resp));
                 printf("\n%s", resp);
